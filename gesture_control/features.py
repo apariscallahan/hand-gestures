@@ -27,10 +27,10 @@ class Pose(StrEnum):
     OPEN = "open"
     FIST = "fist"
     PINCH = "pinch"
+    POINTING = "pointing"
     THUMB_UP = "thumb_up"
     THUMB_DOWN = "thumb_down"
     VICTORY = "victory"
-    POINTING_UP = "pointing_up"
     LOVE_YOU = "love_you"
     OTHER = "other"
 
@@ -40,9 +40,13 @@ MODEL_POSES = {
     "Thumb_Up": Pose.THUMB_UP,
     "Thumb_Down": Pose.THUMB_DOWN,
     "Victory": Pose.VICTORY,
-    "Pointing_Up": Pose.POINTING_UP,
+    "Pointing_Up": Pose.POINTING,
     "ILoveYou": Pose.LOVE_YOU,
 }
+
+# Finger segments the thumb touches when it is pressed in against a pointing
+# hand: the index finger's base, and the curled middle finger.
+THUMB_PRESS_SEGMENTS = ((5, 6), (9, 10), (10, 11))
 
 
 @dataclass
@@ -65,6 +69,7 @@ class HandFeatures:
     extended: int  # how many of the four fingers are straight
     pinch: float  # thumb-tip to index-tip gap, in palm lengths
     thumb_out: float  # thumb-tip to middle knuckle, in palm lengths
+    thumb_gap: float  # thumb tip to the side of the index/middle finger, in palm lengths
     obs: HandObservation
 
     @property
@@ -73,10 +78,21 @@ class HandFeatures:
         lm = self.obs.landmarks
         return (float(lm[THUMB_TIP, 0] + lm[INDEX_TIP, 0]) / 2, float(lm[THUMB_TIP, 1] + lm[INDEX_TIP, 1]) / 2)
 
+    @property
+    def tip(self) -> tuple[float, float]:
+        """Index fingertip in normalised image coordinates."""
+        return float(self.obs.landmarks[INDEX_TIP, 0]), float(self.obs.landmarks[INDEX_TIP, 1])
+
 
 def _angle(a: np.ndarray, b: np.ndarray) -> float:
     cos = float(a @ b) / (float(np.linalg.norm(a) * np.linalg.norm(b)) + 1e-9)
     return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+
+
+def _segment_distance(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    ab = b - a
+    t = np.clip(float((p - a) @ ab) / (float(ab @ ab) + 1e-12), 0.0, 1.0)
+    return float(np.linalg.norm(p - (a + t * ab)))
 
 
 def finger_curl(world: np.ndarray, mcp: int, pip: int, dip: int, tip: int) -> float:
@@ -116,20 +132,29 @@ class PoseClassifier:
         extended = sum(c < EXTENDED_BELOW for c in curls)
         pinch = float(np.linalg.norm(world[THUMB_TIP] - world[INDEX_TIP])) / palm_len
         thumb_out = float(np.linalg.norm(world[THUMB_TIP] - world[MIDDLE_MCP])) / palm_len
+        thumb_gap = min(_segment_distance(world[THUMB_TIP], world[a], world[b])
+                        for a, b in THUMB_PRESS_SEGMENTS) / palm_len
 
         limit = self.pinch_off if self._pinching else self.pinch_on
         self._pinching = pinch < limit and curls[0] < PINCH_INDEX_MAX_CURL
 
         model_pose = MODEL_POSES.get(obs.gesture) if obs.gesture_score >= MODEL_MIN_SCORE else None
         model_fist = obs.gesture == "Closed_Fist" and obs.gesture_score >= MODEL_MIN_SCORE
-        folded = all(c > CURLED_ABOVE for c in curls)
+        straight = [c < EXTENDED_BELOW for c in curls]
+        folded = [c > CURLED_ABOVE for c in curls]
 
         if self._pinching:
             pose = Pose.PINCH
+        elif straight[0] and all(folded[1:]):
+            # Checked before the model, which can mistake a pointing hand with
+            # the thumb sticking out for a thumbs up.
+            pose = Pose.POINTING
         elif model_pose is not None:
             pose = model_pose
-        elif folded and (thumb_out < THUMB_TUCKED_BELOW or model_fist):
+        elif all(folded) and (thumb_out < THUMB_TUCKED_BELOW or model_fist):
             pose = Pose.FIST
+        elif straight[0] and straight[1] and folded[2] and folded[3]:
+            pose = Pose.VICTORY
         elif extended == 4 or (extended == 3 and obs.gesture == "Open_Palm"):
             pose = Pose.OPEN
         else:
@@ -153,5 +178,6 @@ class PoseClassifier:
             extended=extended,
             pinch=pinch,
             thumb_out=thumb_out,
+            thumb_gap=thumb_gap,
             obs=obs,
         )

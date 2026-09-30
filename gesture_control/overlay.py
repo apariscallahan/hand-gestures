@@ -31,15 +31,16 @@ BLUE = _rgb(80, 170, 255)
 PINK = _rgb(240, 110, 200)
 AMBER = _rgb(255, 190, 60)
 RED = _rgb(240, 85, 85)
+CYAN = _rgb(70, 215, 230)
 
 POSE_STYLE = {
     Pose.OPEN: ("open hand", GREEN),
     Pose.FIST: ("fist", BLUE),
     Pose.PINCH: ("pinch", PINK),
+    Pose.POINTING: ("mouse", CYAN),
     Pose.THUMB_UP: ("thumbs up", AMBER),
     Pose.THUMB_DOWN: ("thumbs down", AMBER),
     Pose.VICTORY: ("victory", AMBER),
-    Pose.POINTING_UP: ("pointing up", AMBER),
     Pose.LOVE_YOU: ("love you", AMBER),
     Pose.OTHER: ("hand", TEXT),
 }
@@ -51,11 +52,12 @@ GESTURE_NAMES = {
     "swipe_down": "Swipe down",
     "pinch_hold": "Pinch + hold",
     "fist_hold": "Open hand > fist",
+    "victory_hold": "Victory sign",
     "thumb_up_hold": "Thumbs up",
     "thumb_down_hold": "Thumbs down",
-    "victory_hold": "Victory sign",
-    "pointing_up_hold": "Point up",
     "love_you_hold": "Love-you sign",
+    "point": "Point (index finger)",
+    "thumb_press": "Thumb in, pointing",
 }
 
 SKELETON = (
@@ -213,7 +215,10 @@ class Preview:
 def draw_hud(img, s: float, engine: GestureEngine, info: HudInfo, aspect: float, now: float) -> None:
     """Draw all gesture feedback onto a camera image (in place). `s` is the UI scale."""
     feats = info.features
-    if feats is not None and engine.pose is not None:
+    pointer = engine.pointer if engine.pointer is not None and engine.pointer.active else None
+    if feats is not None and pointer is not None:
+        pose_name, colour = ("mouse - pressed" if pointer.pressed else "mouse"), CYAN
+    elif feats is not None and engine.pose is not None:
         pose_name, colour = POSE_STYLE[engine.pose]
     elif feats is not None:
         pose_name, colour = "hand", TEXT
@@ -221,7 +226,9 @@ def draw_hud(img, s: float, engine: GestureEngine, info: HudInfo, aspect: float,
         pose_name, colour = "no hand", MUTED
 
     if feats is not None:
-        if not engine.switcher_active:
+        if pointer is not None:
+            _draw_pointer(img, pointer, feats, s)
+        elif not engine.switcher_active:
             _draw_trail(img, engine.swipe, aspect, s, now)
         _draw_skeleton(img, feats.obs.landmarks, colour, s)
         _draw_hold(img, engine, feats, info, aspect, s)
@@ -313,6 +320,17 @@ def _draw_trail(img, swipe: SwipeDetector, aspect: float, s: float, now: float) 
         cv2.polylines(img, [np.array(pts, np.int32)], False, colour, max(1, int(3 * s)), AA)
 
 
+def _draw_pointer(img, pointer, feats: HandFeatures, s: float) -> None:
+    """While steering the mouse: the area that maps onto the screen, and the
+    fingertip, filled in while the thumb is pressed."""
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = pointer.area
+    cv2.rectangle(img, (int(x0 * w), int(y0 * h)), (int(x1 * w), int(y1 * h)), CYAN, max(1, int(1.5 * s)), AA)
+    tip = (int(feats.tip[0] * w), int(feats.tip[1] * h))
+    radius = max(5, int(10 * s))
+    cv2.circle(img, tip, radius, CYAN, -1 if pointer.pressed else max(2, int(2 * s)), AA)
+
+
 def _draw_hold(img, engine: GestureEngine, feats: HandFeatures, info: HudInfo, aspect: float, s: float) -> None:
     """Progress ring around the hand while a held gesture counts down."""
     pose = engine.hold_pose
@@ -400,7 +418,7 @@ def _draw_details(img, s: float, feats: HandFeatures | None, engine: GestureEngi
         lines += [
             f"model says {feats.obs.gesture} {feats.obs.gesture_score:.2f}  ({feats.obs.handedness} hand)",
             f"curl  {curls}",
-            f"fingers out {feats.extended}   pinch {feats.pinch:.2f}   thumb {feats.thumb_out:.2f}",
+            f"fingers out {feats.extended}   pinch {feats.pinch:.2f}   thumb gap {feats.thumb_gap:.2f}",
             f"palm {engine.palm:.3f}   swipe {'armed' if engine.swipe.armed else 'waiting'}",
         ]
     scale = 0.38 * s

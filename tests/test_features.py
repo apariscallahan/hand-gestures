@@ -45,7 +45,7 @@ class ModelLabelTests(unittest.TestCase):
     def test_gestures_recognised_by_the_model(self):
         expected = {
             "victory_0": Pose.VICTORY,
-            "pointing_up_0": Pose.POINTING_UP,
+            "pointing_up_0": Pose.POINTING,
             "thumbs_up_0": Pose.THUMB_UP,
             "thumbs_down_0": Pose.THUMB_DOWN,
         }
@@ -68,6 +68,26 @@ class GeometryTests(unittest.TestCase):
         for name, count in (("victory_0", 2), ("pointing_up_0", 1), ("thumbs_up_0", 0), ("thumbs_down_0", 0)):
             with self.subTest(name):
                 self.assertEqual(classify(name, model_label="None").extended, count)
+
+    def test_pointing_and_victory_are_recognised_without_the_model(self):
+        self.assertEqual(classify("pointing_up_0", model_label="None").pose, Pose.POINTING)
+        self.assertEqual(classify("victory_0", model_label="None").pose, Pose.VICTORY)
+
+    def test_pointing_wins_over_a_thumbs_up_label(self):
+        # A pointing hand with the thumb out can fool the model into "thumbs up".
+        self.assertEqual(classify("pointing_up_0", model_label="Thumb_Up").pose, Pose.POINTING)
+
+    def test_thumb_gap_tells_a_tucked_thumb_from_one_sticking_out(self):
+        tucked = classify("pointing_up_0").thumb_gap
+        out = [classify(name).thumb_gap for name in ("thumbs_up_0", "thumbs_down_0", "victory_0")]
+        self.assertLess(tucked, 0.3)
+        self.assertGreater(min(out), 0.6)
+
+    def test_fingertip_position(self):
+        features = classify("pointing_up_0")
+        x, y = features.tip
+        self.assertTrue(0 <= x <= 1 and 0 <= y <= 1)
+        self.assertLess(y, features.obs.landmarks[0, 1])  # a finger pointing up is above the wrist
 
     def test_curled_fingers_with_thumb_sticking_out_is_not_a_fist(self):
         for name in ("thumbs_up_0", "thumbs_down_0"):

@@ -48,27 +48,42 @@ class ActionsConfig:
     swipe_down: str = "none"
     pinch_hold: str = "close_window"
     fist_hold: str = "app_switcher"
+    victory_hold: str = "app_picker"
     thumb_up_hold: str = "none"
     thumb_down_hold: str = "none"
-    victory_hold: str = "none"
-    pointing_up_hold: str = "none"
     love_you_hold: str = "none"
+
+
+@dataclass
+class MouseConfig:
+    enabled: bool = True
+    click: bool = True
+    area_width: float = 0.5
+    area_center_x: float = 0.5
+    area_center_y: float = 0.45
+    smoothing: float = 0.6
+    screen: str = "primary"
+
+
+@dataclass
+class AppPickerConfig:
+    favorites: list[str] = field(default_factory=list)
 
 
 @dataclass
 class TuningConfig:
     require_open_hand_first: bool = True
-    swipe_distance: float = 2.2
+    swipe_distance: float = 2.0
     swipe_speed: float = 3.0
     swipe_max_duration: float = 0.7
-    swipe_cooldown: float = 0.45
+    swipe_cooldown: float = 0.2
     swipe_return_block: float = 1.0
-    pinch_hold_time: float = 0.8
-    fist_hold_time: float = 0.35
-    gesture_hold_time: float = 0.8
+    pinch_hold_time: float = 0.25
+    fist_hold_time: float = 0.15
+    gesture_hold_time: float = 0.3
     switcher_step: float = 0.55
     pinch_threshold: float = 0.25
-    pose_confirm_time: float = 0.08
+    pose_confirm_time: float = 0.05
 
 
 @dataclass
@@ -87,6 +102,8 @@ class Config:
     camera: CameraConfig = field(default_factory=CameraConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     actions: ActionsConfig = field(default_factory=ActionsConfig)
+    mouse: MouseConfig = field(default_factory=MouseConfig)
+    app_picker: AppPickerConfig = field(default_factory=AppPickerConfig)
     tuning: TuningConfig = field(default_factory=TuningConfig)
     preview: PreviewConfig = field(default_factory=PreviewConfig)
 
@@ -94,6 +111,7 @@ class Config:
 CHOICES = {
     ("camera", "backend"): ("msmf", "dshow", "any"),
     ("tracking", "hand"): ("any", "left", "right"),
+    ("mouse", "screen"): ("primary", "all"),
     ("preview", "position"): ("top-left", "top-right", "bottom-left", "bottom-right"),
 }
 
@@ -145,7 +163,11 @@ def _coerce(value, default, where: str):
     elif isinstance(default, str):
         if isinstance(value, str):
             return value.strip()
-    kind = {bool: "true/false", int: "whole number", float: "number", str: "text in quotes"}[type(default)]
+    elif isinstance(default, list):
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            return [item.strip() for item in value if item.strip()]
+    kind = {bool: "true/false", int: "whole number", float: "number", str: "text in quotes",
+            list: 'list of names in quotes, like ["Word", "Spotify"]'}[type(default)]
     raise ConfigError(f"{where} should be a {kind}, got {value!r}")
 
 
@@ -162,3 +184,9 @@ def _validate(cfg: Config, source: str) -> None:
             raise ConfigError(f"{source}: [tuning] {f.name} must be greater than 0")
     if cfg.camera.width <= 0 or cfg.camera.height <= 0 or cfg.camera.fps <= 0:
         raise ConfigError(f"{source}: [camera] width, height and fps must be positive")
+    mouse = cfg.mouse
+    if not 0.1 <= mouse.area_width <= 1.0:
+        raise ConfigError(f"{source}: [mouse] area_width must be between 0.1 and 1.0")
+    for name in ("area_center_x", "area_center_y", "smoothing"):
+        if not 0.0 <= getattr(mouse, name) <= 1.0:
+            raise ConfigError(f"{source}: [mouse] {name} must be between 0 and 1")

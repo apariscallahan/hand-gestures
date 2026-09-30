@@ -13,27 +13,29 @@ from pathlib import Path
 import cv2
 
 from . import __version__, actions, win32
+from .apps import App, AppCatalog, launch
 from .camera import Camera, CameraError, list_cameras
 from .config import PROJECT_DIR, Config, ConfigError, load_config
 from .engine import GestureEngine, GestureEvent
 from .features import HandFeatures, HandObservation, Pose, PoseClassifier
 from .overlay import AMBER, GESTURE_NAMES, RED, TEXT, HudInfo, Preview
+from .picker import AppPicker
+from .pointer import PointerTracker
 from .tracker import HandTracker, ensure_model
 
 log = logging.getLogger("gesture_control")
 
 IDLE_AFTER = 2.0  # seconds without a hand before tracking drops to a lower rate
-IDLE_INTERVAL = 0.1  # ...of at most 10 frames per second, to save CPU
+IDLE_INTERVAL = 0.066  # ...of at most 15 frames per second, to save CPU
 TOAST_SECONDS = 2.5
 CAMERA_RETRY = 3.0
 
 HOLD_POSES = {
     "pinch_hold": Pose.PINCH,
     "fist_hold": Pose.FIST,
+    "victory_hold": Pose.VICTORY,
     "thumb_up_hold": Pose.THUMB_UP,
     "thumb_down_hold": Pose.THUMB_DOWN,
-    "victory_hold": Pose.VICTORY,
-    "pointing_up_hold": Pose.POINTING_UP,
     "love_you_hold": Pose.LOVE_YOU,
 }
 
@@ -52,6 +54,10 @@ class GestureApp:
 
         self.actions = actions.Actions(dry_run)
         self.labels = {g: actions.describe(a) for g, a in self.mapping.items() if a != "none"}
+        if cfg.mouse.enabled:  # shown in the legend alongside the gestures
+            self.labels["point"] = "Move the mouse"
+            if cfg.mouse.click:
+                self.labels["thumb_press"] = "Click (hold to drag)"
         tuning = cfg.tuning
         hold_times = {
             pose: {Pose.PINCH: tuning.pinch_hold_time, Pose.FIST: tuning.fist_hold_time}.get(
@@ -59,12 +65,21 @@ class GestureApp:
             for gesture, pose in HOLD_POSES.items()
             if self.mapping[gesture] != "none"
         }
-        self.engine = GestureEngine(tuning, hold_times, switcher=self.mapping["fist_hold"] == "app_switcher")
+        self.pointer = PointerTracker(cfg.mouse) if cfg.mouse.enabled else None
+        self.switcher_wanted = self.mapping["fist_hold"] == "app_switcher"
+        self.engine = GestureEngine(tuning, hold_times, switcher=self.switcher_wanted, pointer=self.pointer)
         self.classifier = PoseClassifier(tuning.pinch_threshold)
+        if "app_picker" in self.mapping.values():
+            self.catalog: AppCatalog | None = AppCatalog(cfg.app_picker.favorites)
+            self.picker: AppPicker | None = AppPicker(self.catalog, self._launch_app)
+        else:
+            self.catalog = self.picker = None
         self.hud = HudInfo(dry_run=dry_run, labels=self.labels, details=cfg.preview.details)
         self.commands: queue.SimpleQueue[str] = queue.SimpleQueue()
         self.paused = cfg.general.start_paused
         self.hotkey_name = ""
+        self.screen = (0, 0, 1920, 1080)  # set in run(), once DPI awareness is on
+        self._cursor: tuple[int, int] | None = None
         self._toast_until = 0.0
         self._desktop_checked = 0.0
         self._announce_at = 0.0  # when to report the window the app switcher landed on
@@ -73,6 +88,9 @@ class GestureApp:
 
     def run(self) -> int:
         cfg = self.cfg
+        self.screen = win32.screen_rect(cfg.mouse.screen)
+        if self.catalog is not None:
+            self.catalog.load_in_background()
         model = ensure_model(_resolve(cfg.tracking.model_path))
         log.info("Loading the hand-tracking model...")
         tracker = HandTracker(
@@ -96,6 +114,8 @@ class GestureApp:
             if hotkey is not None:
                 hotkey.stop()
             tracker.close()
+            if self.picker is not None:
+                self.picker.close()
             if preview is not None:
                 preview.close()
             log.info("Stopped.")
@@ -119,10 +139,12 @@ class GestureApp:
         for gesture, label in self.labels.items():
             if gesture == "fist_hold" and self.mapping[gesture] == "app_switcher":
                 label += " (move the fist to choose, open your hand to switch)"
-            print(f"  {GESTURE_NAMES[gesture]:<18} {label}")
+            elif gesture == "point":
+                label += " (your index fingertip steers the cursor)"
+            print(f"  {GESTURE_NAMES[gesture]:<22} {label}")
         pause = f"{self.hotkey_name} (anywhere) or P" if self.hotkey_name else "P in the preview window"
-        print(f"\n  Pause / resume     {pause}")
-        print("  Quit               Q in the preview window, or Ctrl+C here\n", flush=True)
+        print(f"\n  {'Pause / resume':<22} {pause}")
+        print(f"  {'Quit':<22} Q in the preview window, or Ctrl+C here\n", flush=True)
 
     # -- main loop -----------------------------------------------------------
 
@@ -162,6 +184,8 @@ class GestureApp:
                         continue
                     if preview is not None:
                         preview.set_frame_size(*camera.size)
+                    if self.pointer is not None:
+                        self.pointer.set_geometry(camera.size[0] / camera.size[1], self.screen[2] / self.screen[3])
                     seq = 0
 
                 try:
@@ -189,7 +213,11 @@ class GestureApp:
                     features = self._track(tracker, frame, stamp)
                     if features is not None:
                         last_hand = stamp
-                    for event in self.engine.update(stamp, features):
+                    # No Alt+Tab while the app picker is up; swipes turn its pages instead.
+                    self.engine.switcher_enabled = self.switcher_wanted and not (self.picker and self.picker.is_open)
+                    events = self.engine.update(stamp, features)
+                    self._steer_mouse()  # before clicks, so they land where the cursor now is
+                    for event in events:
                         self._dispatch(event)
 
                 if preview is not None:
@@ -200,16 +228,26 @@ class GestureApp:
                 camera.close()
 
     def _pump(self, preview: Preview | None) -> bool:
-        """Handle hotkey presses and preview-window keys. False means quit."""
+        """Handle hotkey presses and keys in our windows, and keep the windows
+        responsive. False means quit."""
         while not self.commands.empty():
             command = self.commands.get()
             if command == "quit":
                 return False
             if command == "pause":
                 self._set_paused(not self.paused)
+        picker_open = self.picker is not None and self.picker.is_open
+        key = -1
+        if preview is not None or picker_open:
+            key = cv2.waitKey(1)
+            key = -1 if key < 0 else key & 0xFF
+        if picker_open:
+            if key != -1 and self.picker.focused:  # keys typed in the picker are for the picker
+                self.picker.handle_key(key)
+                key = -1
+            self.picker.refresh()
         if preview is None:
             return True
-        key = preview.poll_key(1)
         if key == ord("q") or not preview.is_open():
             return False
         if key in (ord("p"), ord(" ")):
@@ -217,6 +255,17 @@ class GestureApp:
         elif key == ord("d"):
             self.hud.details = not self.hud.details
         return True
+
+    def _steer_mouse(self) -> None:
+        position = self.pointer.position if self.pointer is not None else None
+        if position is None:
+            self._cursor = None
+            return
+        left, top, width, height = self.screen
+        cursor = (round(left + position[0] * (width - 1)), round(top + position[1] * (height - 1)))
+        if cursor != self._cursor:
+            self._cursor = cursor
+            self.actions.move_mouse(*cursor)
 
     def _open_camera(self) -> Camera:
         c = self.cfg.camera
@@ -245,6 +294,9 @@ class GestureApp:
     # -- reacting to gestures ----------------------------------------------
 
     def _dispatch(self, event: GestureEvent) -> None:
+        if event.kind == "mouse":
+            self.actions.mouse_button(event.name == "down")
+            return
         if event.kind == "switcher":
             switcher = self.actions.switcher
             if event.name == "open":
@@ -264,11 +316,40 @@ class GestureApp:
                 log.info("App switcher: %s", event.name)
             return
         action = self.mapping.get(event.name, "none")
+        if self.picker is not None and self.picker.is_open:
+            self._picker_gesture(event.name, action)
+            return
         if action == "none":
+            return
+        if action == "app_picker":
+            self.picker.open()
+            log.info("%-18s -> App picker", GESTURE_NAMES.get(event.name, event.name))
             return
         message = self.actions.run(action)
         log.info("%-18s -> %s", GESTURE_NAMES.get(event.name, event.name), message)
         self._toast(message)
+
+    def _picker_gesture(self, gesture: str, action: str) -> None:
+        """While the app picker is open, swipes turn its pages; other gestures wait."""
+        if gesture == "swipe_left":
+            self.picker.next_page()
+        elif gesture == "swipe_right":
+            self.picker.previous_page()
+        elif gesture in ("swipe_up", "swipe_down") or action == "app_picker":
+            self.picker.close()
+
+    def _launch_app(self, app: App) -> None:
+        if self.hud.dry_run:
+            self._toast(f"Would open {app.name}")
+            return
+        try:
+            launch(app)
+        except OSError as exc:
+            log.warning("Couldn't open %s: %s", app.name, exc)
+            self._toast(f"Couldn't open {app.name}")
+            return
+        log.info("App picker       -> Opening %s", app.name)
+        self._toast(f"Opening {app.name}")
 
     def _set_paused(self, paused: bool) -> None:
         if paused == self.paused:
@@ -276,6 +357,8 @@ class GestureApp:
         self.paused = paused
         if paused:
             self._abandon_gestures()
+            if self.picker is not None:
+                self.picker.close()
             log.info("Paused.")
         else:
             log.info("Resumed.")

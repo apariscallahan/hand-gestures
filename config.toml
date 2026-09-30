@@ -6,7 +6,7 @@
 [actions]
 # What each gesture does. Choose from:
 #   next_desktop, previous_desktop, new_desktop, close_desktop, task_view,
-#   show_desktop, close_window, minimize_window, maximize_window, none
+#   show_desktop, close_window, minimize_window, maximize_window, app_picker, none
 # or any key combination, for example "hotkey:ctrl+shift+esc",
 # "hotkey:volumeup" or "hotkey:playpause".
 # Left and right are as you see yourself in the preview window.
@@ -19,16 +19,33 @@ swipe_down  = "none"              # careful: dropping your hand looks a lot like
 
 # Held gestures: start from an open hand, make the gesture, and hold it still
 # until the ring in the preview fills up.
-pinch_hold  = "close_window"      # thumb and index fingertips touching
-fist_hold   = "app_switcher"      # opens Alt+Tab: move the fist left/right to choose,
+pinch_hold   = "close_window"     # thumb and index fingertips touching
+fist_hold    = "app_switcher"     # opens Alt+Tab: move the fist left/right to choose,
                                   # open your hand to switch. Can also be any action above.
+victory_hold = "app_picker"       # peace sign: a full-screen list of your apps to click
 
 # Off by default because people make these naturally, e.g. on video calls.
-thumb_up_hold    = "none"
-thumb_down_hold  = "none"
-victory_hold     = "none"         # peace sign
-pointing_up_hold = "none"
-love_you_hold    = "none"         # thumb, index and little finger out
+thumb_up_hold   = "none"
+thumb_down_hold = "none"
+love_you_hold   = "none"          # thumb, index and little finger out
+
+[mouse]
+# Point with your index finger (other fingers curled) and the cursor follows
+# your fingertip. Press your thumb in against your hand to click; keep it
+# pressed to drag. While you point, the preview outlines the steering area.
+enabled = true
+click = true
+area_width = 0.5       # share of the camera image's width that spans the whole screen;
+                       # smaller means less arm movement but a less steady cursor
+area_center_x = 0.5    # where the steering area sits in the camera image (0..1)
+area_center_y = 0.45
+smoothing = 0.6        # 0..1: higher is steadier, lower follows the finger more tightly
+screen = "primary"     # "primary" monitor, or "all" monitors
+
+[app_picker]
+# Apps on the Favorites page, by the names the Start menu shows. Leave empty
+# to use the apps pinned to your taskbar, topped up with common ones.
+favorites = []         # for example ["Spotify", "Google Chrome", "File Explorer"]
 
 [general]
 pause_hotkey = "ctrl+alt+g"       # pause/resume from any window ("" turns it off)
@@ -52,19 +69,19 @@ model_path = "models/gesture_recognizer.task"
 
 [tuning]
 # Larger numbers make a gesture harder to trigger by accident, smaller ones
-# make it easier to perform. Press D in the preview to see the live values.
+# make it quicker to perform. Press D in the preview to see the live values.
 require_open_hand_first = true   # held gestures must start from an open hand
-swipe_distance = 2.2       # how far a swipe must travel, in palm lengths
+swipe_distance = 2.0       # how far a swipe must travel, in palm lengths (quick flicks need less)
 swipe_speed = 3.0          # how fast it must start, in palm lengths per second
 swipe_max_duration = 0.7   # seconds
-swipe_cooldown = 0.45      # seconds before another swipe can start
+swipe_cooldown = 0.2       # seconds before another swipe can start
 swipe_return_block = 1.0   # seconds the opposite direction is ignored after a swipe
-pinch_hold_time = 0.8      # seconds to hold a pinch
-fist_hold_time = 0.35      # seconds to hold a fist before the app switcher opens
-gesture_hold_time = 0.8    # seconds for thumbs up, victory, etc.
+pinch_hold_time = 0.25     # seconds to hold a pinch
+fist_hold_time = 0.15      # seconds to hold a fist before the app switcher opens
+gesture_hold_time = 0.3    # seconds for the victory sign, thumbs up, etc.
 switcher_step = 0.55       # fist travel per app in the switcher, in palm lengths
 pinch_threshold = 0.25     # fingertip gap that counts as a pinch, in palm lengths
-pose_confirm_time = 0.08   # seconds a hand shape must last before it counts
+pose_confirm_time = 0.05   # seconds a hand shape must last before it counts
 
 [preview]
 enabled = true

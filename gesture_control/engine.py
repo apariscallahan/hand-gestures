@@ -1,4 +1,5 @@
-"""Gestures over time: swipes, held poses and the fist-grab app switcher.
+"""Gestures over time: swipes, held poses, the fist-grab app switcher, and
+(through a PointerTracker) the finger mouse.
 
 The engine is pure logic. It is fed one HandFeatures (or None when no hand
 is visible) per camera frame, with a timestamp in seconds, and returns the
@@ -14,27 +15,32 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .config import TuningConfig
 from .features import HandFeatures, Pose
 
+if TYPE_CHECKING:
+    from .pointer import PointerTracker
+
 LOST_RESET = 0.3  # hand gone this long: its return counts as a new hand
 JUMP_DISTANCE = 0.35  # frame heights in a single frame: the tracker switched hands
 INTENT_WINDOW = 1.5  # held gestures must begin within this long of an open hand
-HOLD_MAX_MOTION = 0.6  # palm lengths the hand may drift while holding a pose
-COOLDOWN_AFTER_SWITCHER = 0.5
+HOLD_MAX_MOTION = 0.25  # palm lengths the hand may drift while holding a pose
+COOLDOWN_AFTER_SWITCHER = 0.25
 SWITCHER_LOST_CANCEL = 0.8  # hand gone this long while switching: cancel
 SWITCHER_TIMEOUT = 20.0
 STEP_HYSTERESIS = 0.15  # in steps; stops the selection flickering at a boundary
-RELEASE_TIME = 0.15  # an open hand held this long picks the app...
-RELAXED_RELEASE_TIME = 0.6  # ...as does any other non-fist pose held this long
+RELEASE_TIME = 0.08  # an open hand held this long picks the app...
+RELAXED_RELEASE_TIME = 0.4  # ...as does any other non-fist pose held this long
 
 # Swipe detection
-ARM_TIME = 0.3  # a newly seen hand must be tracked this long...
-SETTLE_TIME = 0.12  # ...and be still this long before it can swipe
+ARM_TIME = 0.1  # a newly seen hand must be tracked this long and have paused once
+VERTICAL_SETTLE = 0.12  # up/down swipes need a pause this long first (raising a hand isn't a swipe)
 VELOCITY_WINDOW = 0.07
 STROKE_LOOKBACK = 0.1  # a stroke is noticed a little after it really starts
 MIN_SWIPE, MAX_SWIPE = 0.12, 0.5  # frame heights
+FLICK_DISCOUNT = 0.65  # the fastest flicks need only this share of swipe_distance
 AXIS_RATIO = 1.5  # travel along the main axis vs across it
 OPEN_FRACTION = 0.5  # share of a stroke's frames the hand must be open in
 OPPOSITE = {"left": "right", "right": "left", "up": "down", "down": "up"}
@@ -109,8 +115,10 @@ class _Stroke:
     t0: float
     x0: float
     y0: float
+    settled: float  # how long the hand was still right before this stroke
     frames: int = 0
     open_frames: int = 0
+    peak: float = 0.0  # fastest speed so far
     spent: bool = False  # already judged; ignore until the hand slows down
 
 
@@ -119,9 +127,9 @@ class SwipeDetector:
 
     A stroke starts when the hand speeds up past `swipe_speed` and ends when it
     slows to half of that. It becomes a swipe the moment it has travelled
-    `swipe_distance` along one axis. Afterwards the hand has to come to rest
-    before the next swipe, and the opposite direction stays blocked for a
-    moment, so bringing the hand back doesn't count as a swipe of its own.
+    `swipe_distance` along one axis (less for a fast flick). Each stroke gives
+    at most one swipe, and after a swipe the opposite direction stays blocked
+    for a moment, so bringing the hand back doesn't count as a swipe of its own.
     """
 
     def __init__(self, tuning: TuningConfig) -> None:
@@ -138,6 +146,7 @@ class SwipeDetector:
         self.stroke: _Stroke | None = None
         self.armed = False
         self._calm_since: float | None = None
+        self._settled = 0.0
 
     def update(self, t: float, center: tuple[float, float], unit: float, openish: bool,
                track_age: float) -> str | None:
@@ -150,36 +159,38 @@ class SwipeDetector:
         v_start = self.tuning.swipe_speed * unit
         v_end = 0.5 * v_start
 
-        if t < self._cooldown_until:
+        if speed < v_end:
+            # At rest: any stroke is over. A hand only becomes able to swipe once
+            # it has paused, so moving into view isn't mistaken for a swipe.
             self.stroke = None
-            self._calm_since = None
-            return None
-
-        if not self.armed:
-            if speed >= v_end:
-                self._calm_since = None
-                return None
             if self._calm_since is None:
                 self._calm_since = t
-            self.armed = track_age >= ARM_TIME and t - self._calm_since >= SETTLE_TIME
+            if track_age >= ARM_TIME:
+                self.armed = True
+            return None
+        if self._calm_since is not None:
+            self._settled = t - self._calm_since
+            self._calm_since = None
+        if not self.armed or t < self._cooldown_until:
             return None
 
         stroke = self.stroke
         if stroke is None:
             if speed < v_start:
                 return None
-            stroke = self.stroke = _Stroke(*self._sample_at(t - STROKE_LOOKBACK))
-
+            stroke = self.stroke = _Stroke(*self._sample_at(t - STROKE_LOOKBACK), settled=self._settled)
         stroke.frames += 1
         stroke.open_frames += openish
-        if speed < v_end or t - stroke.t0 > self.tuning.swipe_max_duration:
-            self.stroke = None
-            return None
+        stroke.peak = max(stroke.peak, speed)
         if stroke.spent:
+            return None
+        if t - stroke.t0 > self.tuning.swipe_max_duration:
+            stroke.spent = True  # too slow to be a swipe
             return None
 
         dx, dy = x - stroke.x0, y - stroke.y0
-        need = _clamp(self.tuning.swipe_distance * unit, MIN_SWIPE, MAX_SWIPE)
+        flick = _clamp(2 * v_start / stroke.peak, FLICK_DISCOUNT, 1.0)
+        need = _clamp(self.tuning.swipe_distance * unit * flick, MIN_SWIPE, MAX_SWIPE)
         if abs(dx) >= need and abs(dx) >= AXIS_RATIO * abs(dy):
             direction = "right" if dx > 0 else "left"
         elif abs(dy) >= need and abs(dy) >= AXIS_RATIO * abs(dx):
@@ -187,18 +198,17 @@ class SwipeDetector:
         else:
             return None
 
-        stroke.spent = True
+        stroke.spent = True  # one swipe per stroke, however far the hand keeps going
         if stroke.open_frames < OPEN_FRACTION * stroke.frames:
             return None
+        if direction in ("up", "down") and stroke.settled < VERTICAL_SETTLE:
+            return None  # raising or lowering a hand in one sweep isn't a swipe
         if direction == self._blocked and t < self._blocked_until:
             return None
         self.last = (direction, t)
         self._cooldown_until = t + self.tuning.swipe_cooldown
         self._blocked = OPPOSITE[direction]
         self._blocked_until = t + self.tuning.swipe_return_block
-        self.armed = False
-        self._calm_since = None
-        self.stroke = None
         return direction
 
     def _speed(self, t: float, x: float, y: float) -> float:
@@ -225,13 +235,16 @@ class GestureEngine:
 
     `hold_times` maps each held pose that has an action (pinch, fist, thumbs
     up, ...) to how many seconds it must be held. With `switcher` on, holding
-    a fist opens the Alt+Tab switcher instead of firing a one-shot event.
+    a fist opens the Alt+Tab switcher instead of firing a one-shot event. With
+    a `pointer`, pointing with the index finger steers the mouse.
     """
 
-    def __init__(self, tuning: TuningConfig, hold_times: dict[Pose, float], switcher: bool = True) -> None:
+    def __init__(self, tuning: TuningConfig, hold_times: dict[Pose, float], switcher: bool = True,
+                 pointer: PointerTracker | None = None) -> None:
         self.tuning = tuning
         self.hold_times = dict(hold_times)
         self.switcher_enabled = switcher and Pose.FIST in self.hold_times
+        self.pointer = pointer
         self.swipe = SwipeDetector(tuning)
         self._pose_filter = PoseFilter(tuning.pose_confirm_time)
         self._fx, self._fy = OneEuroFilter(), OneEuroFilter()
@@ -270,6 +283,8 @@ class GestureEngine:
         events: list[GestureEvent] = []
         if hand is None:
             self._hand_missing(t, events)
+            if self.pointer is not None:
+                events += self.pointer.update(t, None, None)
             return events
 
         if not self.hand_visible:
@@ -295,7 +310,15 @@ class GestureEngine:
 
         if self.switcher_active:
             self._update_switcher(t, hand, events)
-        elif t >= self._cooldown_until:
+            return events
+        if self.pointer is not None:
+            events += self.pointer.update(t, hand, pose)
+            if self.pointer.active:
+                # Steering the mouse: no swipes or held gestures meanwhile.
+                self.swipe.reset()
+                self._clear_hold()
+                return events
+        if t >= self._cooldown_until:
             direction = self.swipe.update(t, hand.center, self.unit, openish, t - self._track_start)
             if direction:
                 self._clear_hold()
@@ -309,6 +332,8 @@ class GestureEngine:
         events: list[GestureEvent] = []
         if self.switcher_active:
             self._end_switcher(t, events, "cancel")
+        if self.pointer is not None:
+            events += self.pointer.cancel(t)
         self.hand_visible = False
         self.lost_since = None
         self._reset_tracking()

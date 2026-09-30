@@ -29,6 +29,7 @@ LABELS = {
     "minimize_window": "Minimize window",
     "maximize_window": "Maximize window",
     "app_switcher": "App switcher",
+    "app_picker": "App picker",
     "none": "Nothing",
 }
 
@@ -108,7 +109,20 @@ class Actions:
     def __init__(self, dry_run: bool = False) -> None:
         self.dry_run = dry_run
         self.keyboard = win32.Keyboard()
+        self.mouse = win32.Mouse()
         self.switcher = AppSwitcher(self.keyboard, dry_run)
+
+    def move_mouse(self, x: int, y: int) -> None:
+        if not self.dry_run:
+            self.mouse.move_to(x, y)
+
+    def mouse_button(self, down: bool) -> None:
+        if self.dry_run:
+            return
+        if down:
+            self.mouse.press()
+        else:
+            self.mouse.release()
 
     def run(self, action: str) -> str:
         """Perform an action and return a short message saying what happened."""
@@ -127,9 +141,10 @@ class Actions:
         return ""
 
     def release_all(self) -> None:
-        """Let go of every key we are holding (on exit, on pause, after errors)."""
+        """Let go of every key and mouse button we are holding (on exit, on pause, after errors)."""
         self.switcher.active = False
         self.keyboard.release_all()
+        self.mouse.release_all()
 
     def _press(self, combo: str, message: str) -> str:
         if not self.dry_run:

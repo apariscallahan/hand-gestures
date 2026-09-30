@@ -168,6 +168,61 @@ class Keyboard:
 
 
 # ---------------------------------------------------------------------------
+# Mouse input
+# ---------------------------------------------------------------------------
+
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+MOUSEEVENTF_ABSOLUTE = 0x8000
+SM_CXSCREEN, SM_CYSCREEN = 0, 1
+SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 76, 77, 78, 79
+
+
+def screen_rect(which: str = "primary") -> tuple[int, int, int, int]:
+    """(left, top, width, height) of the primary monitor, or of all monitors together."""
+    metrics = user32.GetSystemMetrics
+    if which == "all":
+        return (metrics(SM_XVIRTUALSCREEN), metrics(SM_YVIRTUALSCREEN),
+                metrics(SM_CXVIRTUALSCREEN), metrics(SM_CYVIRTUALSCREEN))
+    return 0, 0, metrics(SM_CXSCREEN), metrics(SM_CYSCREEN)
+
+
+class Mouse:
+    """Moves the cursor and presses the left button; remembers whether the
+    button is down so it can always be released on exit."""
+
+    def __init__(self) -> None:
+        self.button_down = False
+
+    def _send(self, flags: int, x: int = 0, y: int = 0) -> bool:
+        event = INPUT(type=INPUT_MOUSE)
+        event.mi = MOUSEINPUT(x, y, 0, flags, 0, INJECTED_TAG)
+        return user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) == 1
+
+    def move_to(self, x: int, y: int) -> bool:
+        """Move to screen pixel (x, y); absolute input is scaled to 0..65535 across all monitors."""
+        left, top, width, height = screen_rect("all")
+        nx = round((x - left) * 65535 / max(1, width - 1))
+        ny = round((y - top) * 65535 / max(1, height - 1))
+        return self._send(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny)
+
+    def press(self) -> None:
+        self.button_down = True
+        self._send(MOUSEEVENTF_LEFTDOWN)
+
+    def release(self) -> None:
+        self.button_down = False
+        self._send(MOUSEEVENTF_LEFTUP)
+
+    def release_all(self) -> None:
+        if self.button_down:
+            self.release()
+
+
+# ---------------------------------------------------------------------------
 # Windows (as in top-level windows)
 # ---------------------------------------------------------------------------
 
@@ -180,6 +235,8 @@ GW_OWNER = 4
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
+WS_EX_LAYERED = 0x00080000
+LWA_ALPHA = 0x2
 SW_HIDE = 0
 SW_SHOWNOACTIVATE = 4
 HWND_TOPMOST = wintypes.HWND(-1)
@@ -212,6 +269,8 @@ user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
 user32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
                                 ctypes.c_int, ctypes.c_int, wintypes.UINT)
 user32.SystemParametersInfoW.argtypes = (wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT)
+user32.SetLayeredWindowAttributes.argtypes = (wintypes.HWND, wintypes.DWORD, wintypes.BYTE, wintypes.DWORD)
+user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
 kernel32.GetConsoleWindow.restype = wintypes.HWND
 
 # 32-bit Windows has no *LongPtr functions; the plain versions are equivalent there.
@@ -319,6 +378,39 @@ def style_preview_window(hwnd: int, *, topmost: bool, all_desktops: bool) -> Non
         user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
     user32.SetWindowPos(hwnd, HWND_TOPMOST if topmost else HWND_NOTOPMOST, 0, 0, 0, 0,
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+
+
+def style_overlay_window(hwnd: int, alpha: int = 240) -> None:
+    """A full-screen overlay: slightly see-through, above everything, and like
+    the preview kept out of the taskbar and Alt+Tab and shown on every desktop."""
+    style = _GetWindowLongPtr(hwnd, GWL_EXSTYLE)
+    user32.ShowWindow(hwnd, SW_HIDE)
+    _SetWindowLongPtr(hwnd, GWL_EXSTYLE, (style | WS_EX_TOOLWINDOW | WS_EX_LAYERED) & ~WS_EX_APPWINDOW)
+    user32.SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA)
+    user32.ShowWindow(hwnd, 5)  # SW_SHOW
+    user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED)
+
+
+user32.AttachThreadInput.argtypes = (wintypes.DWORD, wintypes.DWORD, wintypes.BOOL)
+user32.BringWindowToTop.argtypes = (wintypes.HWND,)
+
+
+def set_foreground(hwnd: int) -> bool:
+    """Give a window keyboard focus. Windows refuses this to background
+    programs, unless their input is briefly attached to the foreground window's."""
+    if user32.SetForegroundWindow(hwnd):
+        return True
+    foreground = user32.GetForegroundWindow()
+    other = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+    ours = kernel32.GetCurrentThreadId()
+    if not other or other == ours:
+        return False
+    user32.AttachThreadInput(ours, other, True)
+    try:
+        user32.BringWindowToTop(hwnd)
+        return bool(user32.SetForegroundWindow(hwnd))
+    finally:
+        user32.AttachThreadInput(ours, other, False)
 
 
 def place_window(hwnd: int, corner: str, margin: int = 16) -> None:
